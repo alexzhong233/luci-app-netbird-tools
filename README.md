@@ -69,6 +69,38 @@ PassWall 的豁免随之消失，于是 `wt0` 的流量被当成普通流量送�
 **事件驱动**：`nft monitor` 一看到相关链被改动就立刻补规则，另留一个周期兜底，
 防止 netlink 缓冲溢出时丢事件。
 
+## 排查
+
+**规则判断看的是位置，不是「存在」。** 那条 `return` 必须排在会改写 mark 的
+规则之前；被挤到后面时会删掉重插到第一位，并写一条日志。
+
+**测事件延迟：**
+
+```sh
+netbird-passwall-compat-watch.sh --test
+```
+
+另开一个窗口增删一条规则，对比打印的时间戳和实际操作时间。事件明显滞后，
+说明 `nft monitor` 的 stdout 在管道里是全缓冲——装上 `coreutils-stdbuf` 后
+脚本会自动改用行缓冲。
+
+**别用 `enable` 绕过开关：**
+
+```sh
+/etc/init.d/netbird-passwall-compat-watch enable   # 不要这样做
+```
+
+服务启动时会检查 `mode`，不匹配就直接返回，等于白配一个开机项。要开就用
+`netbird-compat-ctl mode watch`。
+
+**旧的手动进程要先清掉：**
+
+```sh
+pkill -f '[n]etbird-passwall-compat.sh'
+```
+
+否则手动起的进程会和守护同时改规则。
+
 ## 两个已知边界
 
 1. **`wt0` 的转发规则不归本包管**。那两条是 NetBird 运行时插进 `inet fw4` 的，
