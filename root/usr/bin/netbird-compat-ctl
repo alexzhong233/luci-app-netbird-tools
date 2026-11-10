@@ -1,0 +1,290 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# netbird-compat-ctl — NetBird 兼容守护的查询与操作入口。
+#
+# 只给 LuCI（luci-app-netbird-tools）调用，子命令走白名单，不接受任意 shell。
+# 之所以做成一个入口而不是让页面直接调 /etc/init.d/*，是因为 rpcd 的 file
+# 权限是按路径给的，路径越少越安全；参数校验放这里做。
+
+set -u
+
+WATCH_SVC="netbird-passwall-compat-watch"
+WATCH_BIN="/usr/bin/netbird-passwall-compat-watch.sh"
+APPLY_BIN="/usr/bin/netbird-passwall-compat.sh"
+CFG_FILE="/etc/config/netbird-passwall-compat"
+CFG="netbird-passwall-compat.settings"
+
+usage() {
+	cat <<'EOF'
+用法：
+  netbird-compat-ctl status                 打印 key=value 状态
+  netbird-compat-ctl mode off|watch         切换守护模式
+  netbird-compat-ctl watchdog <秒>          兜底检查间隔，0 关闭
+  netbird-compat-ctl once                   立即补一次兼容规则
+  netbird-compat-ctl netbird-restart        重启 netbird，重建 wt0 转发规则
+  netbird-compat-ctl log                    最近 60 行 netbird 相关日志
+EOF
+}
+
+is_enabled() {
+	local f
+	for f in /etc/rc.d/S??"$1"; do
+		[ -e "$f" ] && return 0
+	done
+	return 1
+}
+
+# 命令行里同时包含所有给定关键字的进程数。
+# 不能退回 `ps w | grep -c`：ps 输出里任何一行出现该关键字都会被算进去，
+# 而这里要找的是"netbird 且 service run"这种两段式匹配。
+proc_count() {
+	local entry pid cmd ok pat n
+
+	n=0
+	for entry in /proc/[0-9]*/cmdline; do
+		[ -r "$entry" ] || continue
+		pid="${entry#/proc/}"
+		pid="${pid%/cmdline}"
+		[ "$pid" = "$$" ] && continue
+		cmd=$(tr '\0' ' ' <"$entry" 2>/dev/null)
+		ok=1
+		for pat in "$@"; do
+			case "$cmd" in
+			*"$pat"*) ;;
+			*)
+				ok=0
+				break
+				;;
+			esac
+		done
+		[ "$ok" = 1 ] && n=$((n + 1))
+	done
+	printf '%s' "$n"
+}
+
+# 守护脚本的"实例"个数。
+#
+# watcher 会 fork 两个不 exec 的子 shell（看门狗、读 nft monitor 的那个），
+# fork 不 exec 时 cmdline 原样继承，于是 ps 里有三行一模一样的
+# `/bin/sh /usr/bin/netbird-passwall-compat-watch.sh`。按字符串计数就会把
+# 一个正常实例报成三个，页面据此显示"存在遗留进程"。
+#
+# 这里扫 /proc 并跳过"父进程也跑着同一脚本"的进程，剩下的才是真正独立的实例。
+watch_instances() {
+	local entry pid cmd ppid pcmd n
+
+	n=0
+	for entry in /proc/[0-9]*/cmdline; do
+		[ -r "$entry" ] || continue
+		pid="${entry#/proc/}"
+		pid="${pid%/cmdline}"
+		cmd=$(tr '\0' ' ' <"$entry" 2>/dev/null)
+		case "$cmd" in
+		*"$WATCH_BIN"*) ;;
+		*) continue ;;
+		esac
+		ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
+		if [ -n "${ppid:-}" ] && [ -r "/proc/$ppid/cmdline" ]; then
+			pcmd=$(tr '\0' ' ' <"/proc/$ppid/cmdline" 2>/dev/null)
+			case "$pcmd" in
+			*"$WATCH_BIN"*) continue ;;
+			esac
+		fi
+		n=$((n + 1))
+	done
+	printf '%s' "$n"
+}
+
+is_running() {
+	[ "$(proc_count "$@")" -gt 0 ]
+}
+
+if_status() {
+	ip link show "$1" >/dev/null 2>&1
+}
+
+get_opt() {
+	local v
+	v=$(uci -q get "$CFG.$1" 2>/dev/null)
+	printf '%s' "${v:-$2}"
+}
+
+# 配置文件不是任何软件包的 conffile，全新刷机时不存在；而 uci set 作用在不存在
+# 的文件上并不保证成功（各版本行为不一致），所以改配置之前先落一份默认模板。
+# /etc/config/ 整个目录本来就在 sysupgrade 的保留清单里，升级不会丢。
+ensure_cfg() {
+	[ -f "$CFG_FILE" ] && return 0
+	cat >"$CFG_FILE" <<'EOF'
+config compat 'settings'
+	option mode 'off'
+	option watchdog '60'
+EOF
+	uci -q commit netbird-passwall-compat 2>/dev/null || true
+}
+
+do_status() {
+	local mode watchdog wt0 wt0_rules compat_rules state ip networks nb
+	local nb_en nb_run w_en w_inst w_procs w_state
+
+	mode=$(get_opt mode off)
+	watchdog=$(get_opt watchdog 60)
+
+	if is_enabled netbird; then nb_en=1; else nb_en=0; fi
+	# 只认"netbird 且 service run"的进程：daemon 的 cmdline 是
+	# /usr/sbin/netbird service run，两个关键字必须同时出现。单用 netbird
+	# 会误判，因为 netbird-passwall-compat*.sh 这些脚本名里也带 netbird。
+	if is_running netbird "service run"; then
+		nb_run=1
+	else
+		nb_run=0
+	fi
+
+	# netbird CLI 每次都要走一次 unix socket，页面会定期刷新，
+	# 分开调三次等于几十次往返。只取一次再解析。
+	nb=$(netbird status 2>/dev/null)
+	state=$(printf '%s\n' "$nb" | sed -n 's/^Management: *//p' | head -n1)
+	ip=$(printf '%s\n' "$nb" | sed -n 's/^NetBird IP: *//p' | head -n1)
+	ip=${ip%%/*}
+	networks=$(printf '%s\n' "$nb" | sed -n 's/^Networks: *//p' | head -n1)
+
+	if if_status wt0; then wt0=1; else wt0=0; fi
+	wt0_rules=$(nft list chain inet fw4 forward 2>/dev/null | grep -c 'wt0')
+	compat_rules=$(nft list ruleset 2>/dev/null | grep -c 'PW-NB-COMPAT')
+
+	if is_enabled "$WATCH_SVC"; then w_en=1; else w_en=0; fi
+
+	w_inst=$(watch_instances)
+	w_procs=$(proc_count "$WATCH_BIN")
+
+	# 守护实例 0 个 = 没跑；1 个且模式是 watch = 正常；1 个但模式已 off =
+	# 上个固件留下的实例（procd 不会自己停它）；多于 1 个才是真的遗留进程。
+	case "$w_inst" in
+	0) w_state=off ;;
+	1)
+		if [ "$mode" = "watch" ]; then
+			w_state=ok
+		else
+			w_state=orphan
+		fi
+		;;
+	*) w_state=stray ;;
+	esac
+
+	cat <<EOF
+mode=$mode
+watchdog=$watchdog
+netbird_enabled=$nb_en
+netbird_running=$nb_run
+netbird_state=${state:-unknown}
+netbird_ip=${ip:-}
+networks=${networks:-}
+watch_enabled=$w_en
+watch_state=$w_state
+watch_running=$w_inst
+watch_procs=$w_procs
+wt0=$wt0
+wt0_rules=$wt0_rules
+compat_rules=$compat_rules
+EOF
+}
+
+set_mode() {
+	local mode
+	mode="${1:-}"
+
+	case "$mode" in
+	off | watch) ;;
+	*)
+		echo "无效模式：$mode（只接受 off / watch）" >&2
+		return 1
+		;;
+	esac
+
+	ensure_cfg
+	uci -q set "$CFG.mode=$mode" || {
+		echo "写入 uci 失败" >&2
+		return 1
+	}
+	uci -q commit netbird-passwall-compat || {
+		echo "提交 uci 失败" >&2
+		return 1
+	}
+
+	# 先停干净再按模式决定是否启用，避免留下上一次的实例。
+	/etc/init.d/$WATCH_SVC stop >/dev/null 2>&1
+	/etc/init.d/$WATCH_SVC disable >/dev/null 2>&1
+
+	if [ "$mode" = "watch" ]; then
+		/etc/init.d/$WATCH_SVC enable >/dev/null 2>&1
+		/etc/init.d/$WATCH_SVC start >/dev/null 2>&1
+	fi
+
+	echo "模式已切换为 $mode"
+}
+
+set_number() {
+	local key label value
+	key="$1"
+	label="$2"
+	value="${3:-}"
+
+	case "$value" in
+	'' | *[!0-9]*)
+		echo "$label 必须是数字：$value" >&2
+		return 1
+		;;
+	esac
+
+	ensure_cfg
+	uci -q set "$CFG.$key=$value" || return 1
+	uci -q commit netbird-passwall-compat || return 1
+	echo "$label 已设为 $value"
+
+	# 正在跑的服务要重启才能读到新间隔
+	if [ "$(get_opt mode off)" = "watch" ]; then
+		/etc/init.d/$WATCH_SVC restart >/dev/null 2>&1
+	fi
+}
+
+case "${1:-}" in
+status)
+	do_status
+	;;
+mode)
+	set_mode "${2:-}"
+	;;
+watchdog)
+	set_number watchdog "兜底间隔" "${2:-}"
+	;;
+once)
+	[ -x "$APPLY_BIN" ] || {
+		echo "找不到 $APPLY_BIN" >&2
+		exit 1
+	}
+	echo "执行一次兼容规则检查..."
+	if "$APPLY_BIN" --once; then
+		echo "完成。当前兼容规则条数：$(nft list ruleset 2>/dev/null | grep -c 'PW-NB-COMPAT')"
+	else
+		echo "执行失败（退出码 $?）" >&2
+		exit 1
+	fi
+	;;
+netbird-restart)
+	echo "重启 NetBird 以重建 wt0 转发规则..."
+	/etc/init.d/netbird restart >/dev/null 2>&1
+	sleep 6
+	echo "wt0 转发规则：$(nft list chain inet fw4 forward 2>/dev/null | grep -c 'wt0') 条"
+	;;
+log)
+	logread -e netbird 2>/dev/null | tail -n 60
+	;;
+'' | help | --help | -h)
+	usage
+	;;
+*)
+	echo "未知子命令：$1" >&2
+	echo "可用：status mode watchdog once netbird-restart log" >&2
+	exit 1
+	;;
+esac

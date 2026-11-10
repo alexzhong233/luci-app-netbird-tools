@@ -1,0 +1,16 @@
+{
+	"luci-app-netbird-tools": {
+		"description": "Inspect NetBird state and control the PassWall compatibility helpers",
+		"read": {
+			"file": {
+				"/usr/bin/netbird-compat-ctl": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/bin/netbird-compat-ctl": [ "exec" ]
+			},
+			"uci": [ "netbird-passwall-compat" ]
+		}
+	}
+}
